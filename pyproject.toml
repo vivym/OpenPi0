@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-pi0"
+dynamic = ["version"]
+description = "Reproduction of Pi0, a general-purpose robot foundation model developed by Physical Intelligence."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "./LICENSE" }
+keywords = ["Robotics", "VLA"]
+authors = [
+  { name = "Ming Yang", email = "ymviv@qq.com" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = [
+]
+
+[project.urls]
+Documentation = "https://github.com/vivym/OpenPi0#readme"
+Issues = "https://github.com/vivym/OpenPi0/issues"
+Source = "https://github.com/vivym/OpenPi0"
+
+[tool.setuptools.dynamic]
+version = {attr = "open_pi0.__version__"}
+
+[tool.pyright]
+exclude = ["data", "wandb", "outputs", "lightning_logs"]
+typeCheckingMode = "off"
