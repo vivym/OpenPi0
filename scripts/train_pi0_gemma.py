@@ -209,7 +209,6 @@ def parse_args(input_args=None) -> Arguments:
         "--pretrained_model_name_or_path",
         type=str,
         default="weights/pi0gemma-3b-mix-224-initial",
-        required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
 
@@ -217,7 +216,6 @@ def parse_args(input_args=None) -> Arguments:
         "--revision",
         type=str,
         default=None,
-        required=False,
         help="Revision of pretrained model identifier from huggingface.co/models.",
     )
 
@@ -858,7 +856,7 @@ def main(args: Arguments):
         else:
             active_dataloader = train_dataloader
 
-        for step, batch in enumerate(active_dataloader):
+        for batch in active_dataloader:
             with accelerator.accumulate(model):
                 outputs: Pi0GemmaForCausalLMOutputWithPast = model(**batch)
                 loss = outputs.loss
@@ -887,7 +885,7 @@ def main(args: Arguments):
 
         model.eval()
         losses = []
-        for step, batch in enumerate(eval_dataloader):
+        for batch in eval_dataloader:
             with torch.no_grad():
                 outputs = model(**batch)
 

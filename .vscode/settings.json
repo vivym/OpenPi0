@@ -1,0 +1,8 @@
+{
+    "files.watcherExclude": {
+        "/data": true,
+        "/outputs": true,
+        "/weights": true,
+        "/tmp": true
+    }
+}
