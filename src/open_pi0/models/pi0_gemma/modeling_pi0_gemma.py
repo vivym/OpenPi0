@@ -11,6 +11,7 @@ from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.modeling_outputs import ModelOutput
 from transformers.modeling_utils import PreTrainedModel
+from transformers.models.auto import AutoModel
 from transformers.utils import logging, is_flash_attn_greater_or_equal_2_10
 
 from .configuration_pi0_gemma import Pi0GemmaConfig
@@ -577,8 +578,8 @@ class Pi0GemmaDecoderLayer(nn.Module):
 
         self.action_mlp = GemmaMLP(
             hidden_size=config.hidden_size,
-            intermediate_size=config.action_intermediate_size,
-            hidden_activation=config.hidden_activation,
+            intermediate_size=config.action_config.intermediate_size,
+            hidden_activation=config.action_config.hidden_activation,
         )
 
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -709,7 +710,7 @@ class Pi0GemmaModel(Pi0GemmaPreTrainedModel):
 
         self.gradient_checkpointing = False
         if getattr(config, "pretraining_tp", 1) != 1:
-            logger.warn("`pretraining_tp` is deprecated, please use `model.tensor_parallel` instead.")
+            logger.warning("`pretraining_tp` is deprecated, please use `model.tensor_parallel` instead.")
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -976,7 +977,7 @@ class Pi0GemmaModel(Pi0GemmaPreTrainedModel):
 
 class Pi0GemmaForCausalLM(Pi0GemmaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
-    _tp_plan = {"lm_head": "colwise_rep", "action_head": "colwise_rep"}
+    _tp_plan = {"lm_head": "colwise_rep"}
 
     def __init__(self, config: Pi0GemmaConfig):
         super().__init__(config)
@@ -984,7 +985,6 @@ class Pi0GemmaForCausalLM(Pi0GemmaPreTrainedModel, GenerationMixin):
         self.model = Pi0GemmaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.action_head = nn.Linear(config.hidden_size, config.action_dim, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1096,7 +1096,21 @@ class Pi0GemmaForCausalLM(Pi0GemmaPreTrainedModel, GenerationMixin):
         )
 
 
-class Pi0GemmaForMotionGeneration(Pi0GemmaPreTrainedModel, GenerationMixin):
+class Pi0GemmaMultiModalProjector(nn.Module):
+    def __init__(self, config: Pi0GemmaConfig):
+        super().__init__()
+
+        self.linear = nn.Linear(
+            config.vision_config.hidden_size, config.hidden_size, bias=True
+        )
+
+    def forward(self, image_features: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.linear(image_features)
+
+        return hidden_states
+
+
+class Pi0GemmaForConditionalGeneration(Pi0GemmaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep", "action_head": "colwise_rep"}
 
@@ -1105,13 +1119,24 @@ class Pi0GemmaForMotionGeneration(Pi0GemmaPreTrainedModel, GenerationMixin):
 
         self.vocab_size = config.vocab_size
 
+        self.vision_tower = AutoModel.from_config(config=config.vision_config)
+        self.multi_modal_projector = Pi0GemmaMultiModalProjector(config)
+
         self.state_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.action_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.action_proj = nn.Linear(
+            config.action_config.action_dim,
+            config.action_config.hidden_size,
+            bias=False,
+        )
 
         self.model = Pi0GemmaModel(config)
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.action_head = nn.Linear(config.hidden_size, config.action_dim, bias=False)
+        self.action_head = nn.Linear(
+            config.action_config.hidden_size,
+            config.action_config.action_dim,
+            bias=False,
+        )
 
         # Initialize weights and apply final processing
         self.post_init()

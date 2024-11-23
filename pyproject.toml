@@ -24,6 +24,11 @@ dependencies = [
   "accelerate>=1.1.1",
   "transformers>=4.46.2",
   "diffusers>=0.31.0",
+  "h5py>=3.12.1",
+  "sentencepiece>=0.2.0",
+  "wandb>=0.18.7",
+  "prodigyopt>=1.0",
+  "bitsandbytes>=0.44.1",
 ]
 
 [project.urls]

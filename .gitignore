@@ -1,8 +1,10 @@
-/wandb
+/debug
 /data
 /lightning_logs
 /outputs
 /tmp
+/wandb
+/weights
 
 # Created by https://www.toptal.com/developers/gitignore/api/visualstudiocode,python
 # Edit at https://www.toptal.com/developers/gitignore?templates=visualstudiocode,python
