@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from diffusers.models.embeddings import Timesteps
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.generation import GenerationMixin
@@ -49,6 +50,7 @@ class Pi0GemmaOutputWithPast(ModelOutput):
     """
 
     last_hidden_state: torch.FloatTensor = None
+    last_action_hidden_state: torch.FloatTensor = None
     past_key_values: Cache | None = None
     hidden_states: tuple[torch.FloatTensor, ...] | None = None
     attentions: tuple[torch.FloatTensor, ...] | None = None
@@ -86,6 +88,37 @@ class Pi0GemmaForCausalLMOutputWithPast(ModelOutput):
     past_key_values: Cache | None = None
     hidden_states: tuple[torch.FloatTensor, ...] | None = None
     attentions: tuple[torch.FloatTensor, ...] | None = None
+
+
+@dataclass
+class Pi0GemmaForConditionalGenerationOutputWithPast(ModelOutput):
+    """
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction).
+        past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+
+            Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
+            `past_key_values` input) to speed up sequential decoding.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+
+    loss: torch.FloatTensor | None = None
+    model_pred: torch.FloatTensor = None
+    past_key_values: Cache | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    attentions: tuple[torch.FloatTensor, ...] | None = None
+    image_hidden_states: torch.FloatTensor | None = None
 
 
 class GemmaRMSNorm(nn.Module):
@@ -228,6 +261,7 @@ class GemmaAttention(nn.Module):
 
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
+        self.action_hidden_size = config.action_config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.num_key_value_heads = config.num_key_value_heads
@@ -255,6 +289,20 @@ class GemmaAttention(nn.Module):
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias
         )
+
+        self.q_proj_action = nn.Linear(
+            self.action_hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj_action = nn.Linear(
+            self.action_hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj_action = nn.Linear(
+            self.action_hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj_action = nn.Linear(
+            self.num_heads * self.head_dim, self.action_hidden_size, bias=config.attention_bias
+        )
+
         self.rotary_emb = GemmaRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
@@ -264,6 +312,7 @@ class GemmaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        action_hidden_states: torch.Tensor | None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_value: Cache | None = None,
@@ -285,6 +334,29 @@ class GemmaAttention(nn.Module):
         value_states = value_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
+
+        if action_hidden_states is not None:
+            a_len = action_hidden_states.shape[1]
+
+            action_query_states: torch.Tensor = self.q_proj_action(action_hidden_states)
+            action_key_states: torch.Tensor = self.k_proj_action(action_hidden_states)
+            action_value_states: torch.Tensor = self.v_proj_action(action_hidden_states)
+
+            action_query_states = action_query_states.view(
+                bsz, a_len, self.num_heads, self.head_dim
+            ).transpose(1, 2)
+            action_key_states = action_key_states.view(
+                bsz, a_len, self.num_key_value_heads, self.head_dim
+            ).transpose(1, 2)
+            action_value_states = action_value_states.view(
+                bsz, a_len, self.num_key_value_heads, self.head_dim
+            ).transpose(1, 2)
+
+            query_states = torch.cat([query_states, action_query_states], dim=2)
+            key_states = torch.cat([key_states, action_key_states], dim=2)
+            value_states = torch.cat([value_states, action_value_states], dim=2)
+        else:
+            a_len = 0
 
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -318,13 +390,21 @@ class GemmaAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
 
-        attn_output = attn_output.view(bsz, q_len, -1)
+        attn_output = attn_output.view(bsz, q_len + a_len, -1)
+
+        if action_hidden_states is not None:
+            action_attn_output = attn_output[:, -a_len:]
+            attn_output = attn_output[:, :-a_len]
+            action_attn_output = self.o_proj_action(action_attn_output)
+        else:
+            action_attn_output = None
+
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        return (attn_output, action_attn_output), attn_weights, past_key_value
 
 
 class GemmaSdpaAttention(GemmaAttention):
@@ -338,6 +418,7 @@ class GemmaSdpaAttention(GemmaAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        action_hidden_states: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_value: Cache | None = None,
@@ -368,6 +449,29 @@ class GemmaSdpaAttention(GemmaAttention):
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        if action_hidden_states is not None:
+            a_len = action_hidden_states.shape[1]
+
+            action_query_states: torch.Tensor = self.q_proj_action(action_hidden_states)
+            action_key_states: torch.Tensor = self.k_proj_action(action_hidden_states)
+            action_value_states: torch.Tensor = self.v_proj_action(action_hidden_states)
+
+            action_query_states = action_query_states.view(
+                bsz, a_len, self.num_heads, self.head_dim
+            ).transpose(1, 2)
+            action_key_states = action_key_states.view(
+                bsz, a_len, self.num_key_value_heads, self.head_dim
+            ).transpose(1, 2)
+            action_value_states = action_value_states.view(
+                bsz, a_len, self.num_key_value_heads, self.head_dim
+            ).transpose(1, 2)
+
+            query_states = torch.cat([query_states, action_query_states], dim=2)
+            key_states = torch.cat([key_states, action_key_states], dim=2)
+            value_states = torch.cat([value_states, action_value_states], dim=2)
+        else:
+            a_len = 0
 
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -407,11 +511,18 @@ class GemmaSdpaAttention(GemmaAttention):
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, -1)
+        attn_output = attn_output.view(bsz, q_len + a_len, -1)
+
+        if action_hidden_states is not None:
+            action_attn_output = attn_output[:, -a_len:]
+            attn_output = attn_output[:, :-a_len]
+            action_attn_output = self.o_proj_action(action_attn_output)
+        else:
+            action_attn_output = None
 
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, None, past_key_value
+        return (attn_output, action_attn_output), None, past_key_value
 
 
 class GemmaFlashAttention2(GemmaAttention):
@@ -432,6 +543,7 @@ class GemmaFlashAttention2(GemmaAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        action_hidden_states: torch.Tensor | None = None,
         attention_mask: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_value: Cache | None = None,
@@ -458,6 +570,29 @@ class GemmaFlashAttention2(GemmaAttention):
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        if action_hidden_states is not None:
+            a_len = action_hidden_states.shape[1]
+
+            action_query_states: torch.Tensor = self.q_proj_action(action_hidden_states)
+            action_key_states: torch.Tensor = self.k_proj_action(action_hidden_states)
+            action_value_states: torch.Tensor = self.v_proj_action(action_hidden_states)
+
+            action_query_states = action_query_states.view(
+                bsz, a_len, self.num_heads, self.head_dim
+            ).transpose(1, 2)
+            action_key_states = action_key_states.view(
+                bsz, a_len, self.num_key_value_heads, self.head_dim
+            ).transpose(1, 2)
+            action_value_states = action_value_states.view(
+                bsz, a_len, self.num_key_value_heads, self.head_dim
+            ).transpose(1, 2)
+
+            query_states = torch.cat([query_states, action_query_states], dim=2)
+            key_states = torch.cat([key_states, action_key_states], dim=2)
+            value_states = torch.cat([value_states, action_value_states], dim=2)
+        else:
+            a_len = 0
 
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -512,16 +647,24 @@ class GemmaFlashAttention2(GemmaAttention):
             position_ids=position_ids,
             dropout=dropout_rate,
             sliding_window=getattr(self, "sliding_window", None),
-            is_causal=self.is_causal,
+            is_causal=self.is_causal,   # TODO: Check if this is correct
             use_top_left_mask=self._flash_attn_uses_top_left_mask,
         )
-        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len + a_len, -1).contiguous()
+
+        if action_hidden_states is not None:
+            action_attn_output = attn_output[:, -a_len:]
+            attn_output = attn_output[:, :-a_len]
+            action_attn_output = self.o_proj_action(action_attn_output)
+        else:
+            action_attn_output = None
+
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        return (attn_output, action_attn_output), attn_weights, past_key_value
 
 
 GEMMA_ATTENTION_CLASSES: dict[str, GemmaAttention] = {
@@ -564,6 +707,9 @@ class Pi0GemmaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm_action = GemmaRMSNorm(
+            config.action_config.hidden_size, eps=config.rms_norm_eps
+        )
 
         self.self_attn = GEMMA_ATTENTION_CLASSES[config._attn_implementation](
             config=config,
@@ -577,18 +723,21 @@ class Pi0GemmaDecoderLayer(nn.Module):
         )
 
         self.action_mlp = GemmaMLP(
-            hidden_size=config.hidden_size,
+            hidden_size=config.action_config.hidden_size,
             intermediate_size=config.action_config.intermediate_size,
             hidden_activation=config.action_config.hidden_activation,
         )
 
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm_action = GemmaRMSNorm(
+            config.action_config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        action_hidden_states: torch.Tensor | None,
         attention_mask: torch.Tensor,
-        token_type_ids: torch.LongTensor | None,
         position_ids: torch.Tensor,
         past_key_value: Cache | None = None,
         output_attentions: bool = False,
@@ -616,12 +765,16 @@ class Pi0GemmaDecoderLayer(nn.Module):
                 into the model
         """
         residual = hidden_states
-
         hidden_states = self.input_layernorm(hidden_states)
 
+        if action_hidden_states is not None:
+            residual_action = action_hidden_states
+            action_hidden_states = self.input_layernorm_action(action_hidden_states)
+
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        (hidden_states, action_hidden_states), self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
+            action_hidden_states=action_hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -631,25 +784,22 @@ class Pi0GemmaDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
+        if action_hidden_states is not None:
+            action_hidden_states = residual_action + action_hidden_states
+
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-
-        lm_mask = token_type_ids == 0
-        hidden_states_lm = gather_first_2d(hidden_states, mask=lm_mask)
-        hidden_states_lm = self.mlp(hidden_states_lm)
-
-        action_mask = ~lm_mask
-        hidden_states_action = gather_first_2d(hidden_states, mask=action_mask)
-        hidden_states_action = self.action_mlp(hidden_states_action)
-
-        hidden_states = torch.empty_like(hidden_states)
-        scatter_first_2d(hidden_states, mask=lm_mask, src=hidden_states_lm)
-        scatter_first_2d(hidden_states, mask=action_mask, src=hidden_states_action)
-
+        hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        if action_hidden_states is not None:
+            residual_action = action_hidden_states
+            action_hidden_states = self.post_attention_layernorm_action(action_hidden_states)
+            action_hidden_states = self.action_mlp(action_hidden_states)
+            action_hidden_states = residual_action + action_hidden_states
+
+        outputs = ((hidden_states, action_hidden_states),)
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -707,6 +857,7 @@ class Pi0GemmaModel(Pi0GemmaPreTrainedModel):
             [Pi0GemmaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_action = GemmaRMSNorm(config.action_config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
         if getattr(config, "pretraining_tp", 1) != 1:
@@ -725,10 +876,10 @@ class Pi0GemmaModel(Pi0GemmaPreTrainedModel):
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: torch.Tensor | None = None,
-        token_type_ids: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
+        action_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -783,12 +934,17 @@ class Pi0GemmaModel(Pi0GemmaPreTrainedModel):
 
         # embed positions
         hidden_states = inputs_embeds
+        action_hidden_states = action_embeds
 
         # normalized
         # Gemma downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
         # See https://github.com/huggingface/transformers/pull/29402
         normalizer = torch.tensor(self.config.hidden_size ** 0.5, dtype=hidden_states.dtype)
         hidden_states = hidden_states * normalizer
+
+        if action_hidden_states is not None:
+            normalizer = self.config.action_config.hidden_size ** 0.5
+            action_hidden_states = action_hidden_states * normalizer
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -797,14 +953,14 @@ class Pi0GemmaModel(Pi0GemmaPreTrainedModel):
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                all_hidden_states += ((hidden_states, action_hidden_states),)
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
+                    action_hidden_states,
                     causal_mask,
-                    token_type_ids,
                     position_ids,
                     past_key_values,
                     output_attentions,
@@ -814,8 +970,8 @@ class Pi0GemmaModel(Pi0GemmaPreTrainedModel):
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
+                    action_hidden_states,
                     attention_mask=causal_mask,
-                    token_type_ids=token_type_ids,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
@@ -823,7 +979,7 @@ class Pi0GemmaModel(Pi0GemmaPreTrainedModel):
                     cache_position=cache_position,
                 )
 
-            hidden_states = layer_outputs[0]
+            hidden_states, action_hidden_states = layer_outputs[0]
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
@@ -831,12 +987,14 @@ class Pi0GemmaModel(Pi0GemmaPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-        # TODO: seperate the norm layer for lm branch and action branch
         hidden_states = self.norm(hidden_states)
+
+        if action_hidden_states is not None:
+            action_hidden_states = self.norm_action(action_hidden_states)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+            all_hidden_states += ((hidden_states, action_hidden_states),)
 
         next_cache = next_decoder_cache if use_cache else None
         if return_legacy_cache:
@@ -844,10 +1002,15 @@ class Pi0GemmaModel(Pi0GemmaPreTrainedModel):
             next_cache = next_cache.to_legacy_cache()
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(
+                v
+                for v in [hidden_states, action_hidden_states, next_cache, all_hidden_states, all_self_attns]
+                if v is not None
+            )
 
         return Pi0GemmaOutputWithPast(
             last_hidden_state=hidden_states,
+            last_action_hidden_state=action_hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
@@ -1061,7 +1224,7 @@ class Pi0GemmaForCausalLM(Pi0GemmaPreTrainedModel, GenerationMixin):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
+        outputs: Pi0GemmaOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1086,7 +1249,6 @@ class Pi0GemmaForCausalLM(Pi0GemmaPreTrainedModel, GenerationMixin):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        outputs: Pi0GemmaOutputWithPast
         return Pi0GemmaForCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -1110,6 +1272,29 @@ class Pi0GemmaMultiModalProjector(nn.Module):
         return hidden_states
 
 
+class TimestepConditionedMLP(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_size: int,
+    ):
+        super().__init__()
+
+        self.fc1 = nn.Linear(input_dim, hidden_size, bias=False)
+        self.fc2 = nn.Linear(hidden_size * 2, hidden_size, bias=False)
+        self.fc3 = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        t_emb = t_emb[:, None, :].expand(-1, x.size(1), -1)
+        x = torch.cat([x, t_emb], dim=-1)
+        x = self.fc2(x)
+        x = F.selu_(x)
+        x = self.fc3(x)
+
+        return x
+
+
 class Pi0GemmaForConditionalGeneration(Pi0GemmaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep", "action_head": "colwise_rep"}
@@ -1122,11 +1307,19 @@ class Pi0GemmaForConditionalGeneration(Pi0GemmaPreTrainedModel, GenerationMixin)
         self.vision_tower = AutoModel.from_config(config=config.vision_config)
         self.multi_modal_projector = Pi0GemmaMultiModalProjector(config)
 
-        self.state_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.action_proj = nn.Linear(
+        self.time_proj = Timesteps(
+            num_channels=config.action_config.hidden_size,
+            flip_sin_to_cos=True,
+            downscale_freq_shift=1,
+        )
+
+        self.state_proj = TimestepConditionedMLP(
+            input_dim=config.action_config.state_dim,
+            hidden_size=config.action_config.hidden_size,
+        )
+        self.action_proj = TimestepConditionedMLP(
             config.action_config.action_dim,
             config.action_config.hidden_size,
-            bias=False,
         )
 
         self.model = Pi0GemmaModel(config)
@@ -1141,38 +1334,248 @@ class Pi0GemmaForConditionalGeneration(Pi0GemmaPreTrainedModel, GenerationMixin)
         # Initialize weights and apply final processing
         self.post_init()
 
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    def set_input_embeddings(self, value):
+    def set_input_embeddings(self, value: nn.Embedding):
         self.model.embed_tokens = value
 
-    def get_output_embeddings(self):
+    def get_output_embeddings(self) -> nn.Module:
         return self.lm_head
 
-    def set_output_embeddings(self, new_embeddings):
+    def set_output_embeddings(self, new_embeddings: nn.Module):
         self.lm_head = new_embeddings
 
-    def set_decoder(self, decoder):
+    def set_decoder(self, decoder: Pi0GemmaModel):
         self.model = decoder
 
-    def get_decoder(self):
+    def get_decoder(self) -> Pi0GemmaModel:
         return self.model
+
+    def _update_causal_mask(
+        self,
+        attention_mask: torch.Tensor | None,
+        inputs_embeds: torch.FloatTensor,
+        action_embeds: torch.FloatTensor,
+        past_key_values: Cache | None,
+        cache_position: torch.LongTensor,
+        is_training: bool = False,
+    ):
+        # TODO: Check if this is correct
+        if self.config._attn_implementation == "flash_attention_2":
+            if attention_mask is not None and 0.0 in attention_mask:
+                return attention_mask
+            return None
+
+        using_static_cache = isinstance(past_key_values, StaticCache)
+        dtype = inputs_embeds.dtype
+        min_dtype = torch.finfo(dtype).min
+        sequence_length = inputs_embeds.shape[1] + action_embeds.shape[1]
+        if using_static_cache:
+            target_length = past_key_values.get_max_length()
+        else:
+            target_length = (
+                attention_mask.shape[-1] + action_embeds.shape[1]
+                if isinstance(attention_mask, torch.Tensor)
+                else cache_position[0] + sequence_length + 1
+            )
+
+        # TODO: Remove this
+        assert sequence_length == target_length, (sequence_length, target_length)
+
+        if attention_mask is not None and attention_mask.dim() == 4:
+            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
+            return attention_mask
+
+        causal_mask: torch.Tensor = torch.zeros(
+            (sequence_length, target_length), dtype=dtype, device=cache_position.device
+        )
+
+        causal_mask[:inputs_embeds.shape[1], inputs_embeds.shape[1]:] = min_dtype
+        causal_mask[inputs_embeds.shape[1]:inputs_embeds.shape[1]+ 1, inputs_embeds.shape[1] + 1:] = min_dtype
+
+        causal_mask = causal_mask[None, None, :, :].expand(inputs_embeds.shape[0], 1, -1, -1)
+
+        if attention_mask is not None:
+            # TODO: optimize this
+
+            attention_mask = attention_mask[:, None, :, None] * attention_mask[:, None, None, :]
+            attention_mask = F.pad(
+                attention_mask,
+                (0, action_embeds.shape[1], 0, action_embeds.shape[1]),
+                mode="constant",
+                value=1,
+            )
+            causal_mask = causal_mask.masked_fill(attention_mask == 0, min_dtype)
+
+        return causal_mask
+
+        # Causal diagonal mask only if training, otherwise attend to the whole prefix. Training-specific attn for prefix is handled below
+        if sequence_length != 1:
+            if is_training:
+                causal_mask = torch.triu(causal_mask, diagonal=1)
+            else:
+                causal_mask[:, :sequence_length] = 0.0
+
+        causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
+        causal_mask = causal_mask[None, None, :, :].expand(inputs_embeds.shape[0], 1, -1, -1)
+        if attention_mask is not None:
+            causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+            mask_length = attention_mask.shape[-1]
+            padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(causal_mask.device)
+            padding_mask = padding_mask == 0
+            causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+                padding_mask, min_dtype
+            )
+            # we are training thus we need to create a full mask on the image + prefix but causal on suffix
+            if is_training:
+                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+                    token_type_ids[:, None, None, :].to(causal_mask.device) == 0, 0
+                )
+        return causal_mask
+
+    def get_image_features(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
+        """
+        Obtains image last hidden states from the vision tower and apply multimodal projection.
+
+        Args:
+            pixel_values (`torch.FloatTensor]` of shape `(batch_size, t, channels, height, width)`)
+               The tensors corresponding to the input images.
+        Returns:
+            image_features (`torch.Tensor`): Image feature tensor of shape `(batch_size, t, image_length, embed_dim)`).
+        """
+        batch_size = pixel_values.shape[0]
+        pixel_values = pixel_values.flatten(0, 1)
+        image_outputs = self.vision_tower(pixel_values)
+        selected_image_feature: torch.Tensor = image_outputs.last_hidden_state
+        image_features: torch.Tensor = self.multi_modal_projector(selected_image_feature)
+        image_features = image_features / (self.config.hidden_size ** 0.5)
+        image_features = image_features.reshape(batch_size, -1, *image_features.shape[1:])
+        return image_features
 
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: torch.Tensor | None = None,
+        pixel_values: torch.FloatTensor = None,
+        propri_states: torch.FloatTensor | None = None,
+        timesteps: torch.FloatTensor | None = None,
+        noisy_actions: torch.FloatTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
-        labels: torch.LongTensor | None = None,
+        targets: torch.FloatTensor | None = None,
+        loss_weights: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
-        num_logits_to_keep: int = 0,
-        **loss_kwargs,
-    ) -> tuple | Pi0GemmaForCausalLMOutputWithPast:
-        ...
+    ) -> tuple | Pi0GemmaForConditionalGenerationOutputWithPast:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if pixel_values is not None and inputs_embeds is not None:
+            raise ValueError(
+                "You cannot specify both pixel_values and inputs_embeds at the same time, and must specify either one"
+            )
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1] + propri_states.shape[1] + noisy_actions.shape[1],
+                device=inputs_embeds.device,
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0) + 1  # Paligemma positions are 1-indexed
+
+        # Merge text and images
+        if pixel_values is not None:
+            image_features = self.get_image_features(pixel_values)
+
+            special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
+            special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
+            if inputs_embeds[special_image_mask].numel() != image_features.numel():
+                image_tokens_in_text = torch.sum(input_ids == self.config.image_token_index)
+                raise ValueError(
+                    f"Number of images does not match number of special image tokens in the input text. "
+                    f"Got {image_tokens_in_text} image tokens in the text but {image_features.shape[0] * image_features.shape[1]} "
+                    "tokens from image embeddings."
+                )
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            # TODO: check if this is the correct way to mask the image tokens
+            # image_features: 4, 4, 256, 2048
+            # inputs_embeds: 4, 1036, 2048
+            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+
+        if timesteps is not None:
+            assert propri_states is not None, "`propri_states` must be provided when `timesteps` is provided"
+            assert noisy_actions is not None, "`noisy_actions` must be provided when `timesteps` is provided"
+
+            t_emb = self.time_proj(timesteps)
+
+            state_embeds = self.state_proj(propri_states, t_emb=t_emb)
+
+            action_embeds = self.action_proj(noisy_actions, t_emb=t_emb)
+
+            action_embeds = torch.cat([state_embeds, action_embeds], dim=1)
+
+        is_training = targets is not None
+
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, action_embeds, past_key_values, cache_position, is_training
+        )
+
+        outputs: Pi0GemmaOutputWithPast = self.model(
+            attention_mask=causal_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            action_embeds=action_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+        )
+
+        if timesteps is not None:
+            action_hidden_states: torch.Tensor = outputs[1]
+
+            model_pred = self.action_head(action_hidden_states[:, 1:])
+
+            loss = None
+            if targets is not None:
+                if loss_weights is not None:
+                    loss = F.mse_loss(model_pred, targets, reduction="none")
+                    loss = loss_weights.float() * loss
+                    loss = loss.reshape(targets.shape[0], -1).mean(1)
+                    loss = loss.mean()
+                else:
+                    loss = F.mse_loss(model_pred, targets)
+        else:
+            raise NotImplementedError
+
+        if not return_dict:
+            output = outputs + (image_features,)
+            return (loss,) + output if loss is not None else output
+
+        return Pi0GemmaForConditionalGenerationOutputWithPast(
+            loss=loss,
+            model_pred=model_pred,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=image_features,
+        )

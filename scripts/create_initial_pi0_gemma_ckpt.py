@@ -44,8 +44,9 @@ def main():
             hidden_size=1024,
             intermediate_size=4096,
             hidden_activation="gelu_pytorch_tanh",
+            state_dim=15,
             action_horizon=64,
-            action_dim=18,
+            action_dim=7,
         ),
         vocab_size=257216,
         hidden_size=2048,
@@ -75,7 +76,7 @@ def main():
     assert len(unexpected_keys) == 0
 
     for key in missing_keys:
-        assert "action_mlp" in key, key
+        assert "action_" in key or "_action" in key, key
 
     model.save_pretrained("weights/pi0gemma-3b-mix-224-initial")
 

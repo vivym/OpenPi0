@@ -14,6 +14,7 @@ from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from diffusers.optimization import get_scheduler
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 from diffusers.utils import is_wandb_available
 from diffusers.utils.torch_utils import is_compiled_module
 from huggingface_hub import create_repo, upload_folder
@@ -24,8 +25,8 @@ from tqdm import tqdm
 from open_pi0.data.calvin import CalvinH5Dataset
 from open_pi0.models.pi0_gemma import (
     Pi0GemmaProcessor,
-    Pi0GemmaForCausalLMOutputWithPast,
     Pi0GemmaForConditionalGeneration,
+    Pi0GemmaForConditionalGenerationOutputWithPast,
 )
 
 logger = get_logger(__name__)
@@ -617,46 +618,53 @@ def main(args: Arguments):
 
     accelerator.wait_for_everyone()
 
-    train_dataset = CalvinH5Dataset(
-        root_path="data/CALVIN/calvin_debug_dataset/training.h5",
-        obs_seq_len=2,
-        action_seq_len=64,
-        use_relative_actions=True,
-        image_size=224,
-        repeat=100,
-        training=True,
+    preprocessor: Pi0GemmaProcessor = Pi0GemmaProcessor.from_pretrained(
+        args.pretrained_model_name_or_path,
+        revision=args.revision,
+        variant=args.variant,
     )
+
+    if args.dataset_name == "CALVIN":
+        train_dataset = CalvinH5Dataset(
+            root_path="data/CALVIN/calvin_debug_dataset/training.h5",
+            obs_seq_len=2,
+            action_seq_len=64,
+            use_relative_actions=True,
+            image_size=224,
+            repeat=10,
+            training=True,
+            preprocessor=preprocessor,
+        )
+
+        eval_dataset = CalvinH5Dataset(
+            root_path="data/CALVIN/calvin_debug_dataset/validation.h5",
+            obs_seq_len=2,
+            action_seq_len=64,
+            use_relative_actions=True,
+            image_size=224,
+            repeat=10,
+            training=False,
+            preprocessor=preprocessor,
+        )
+    else:
+        raise ValueError(f"Dataset {args.dataset_name} not found.")
 
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.per_device_train_batch_size,
+        collate_fn=preprocessor.collate,
         num_workers=args.dataloader_num_workers,
         shuffle=True,
         pin_memory=True,
     )
 
-    eval_dataset = CalvinH5Dataset(
-        root_path="data/CALVIN/calvin_debug_dataset/validation.h5",
-        obs_seq_len=2,
-        action_seq_len=64,
-        use_relative_actions=True,
-        image_size=224,
-        repeat=100,
-        training=False,
-    )
-
     eval_dataloader = DataLoader(
         eval_dataset,
         batch_size=args.per_device_eval_batch_size,
+        collate_fn=preprocessor.collate,
         num_workers=args.dataloader_num_workers,
         shuffle=False,
         pin_memory=True,
-    )
-
-    preprocessor: Pi0GemmaProcessor = Pi0GemmaProcessor.from_pretrained(
-        args.pretrained_model_name_or_path,
-        revision=args.revision,
-        variant=args.variant,
     )
 
     noise_scheduler: FlowMatchEulerDiscreteScheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -845,6 +853,19 @@ def main(args: Arguments):
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
+    def get_sigmas(timesteps: torch.Tensor, n_dim=4, dtype=torch.float32) -> torch.Tensor:
+        sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=dtype)
+        schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
+        timesteps = timesteps.to(accelerator.device)
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+
+    num_train_timesteps: int = noise_scheduler.config.num_train_timesteps
+
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
 
@@ -858,8 +879,50 @@ def main(args: Arguments):
 
         for batch in active_dataloader:
             with accelerator.accumulate(model):
-                outputs: Pi0GemmaForCausalLMOutputWithPast = model(**batch)
+                input_ids: torch.Tensor = batch["input_ids"]
+                attention_mask: torch.Tensor = batch["attention_mask"]
+                pixel_values: torch.Tensor = batch["pixel_values"]
+                propri_states: torch.Tensor = batch["propri_states"]
+                actions: torch.Tensor = batch["actions"]
+
+                # Sample noise that we'll add to the actions
+                noise = torch.randn_like(actions)
+
+                # Sample a random timestep for each sample in the batch
+                # for weighting schemes where we sample timesteps non-uniformly
+                u = compute_density_for_timestep_sampling(
+                    weighting_scheme=args.weighting_scheme,
+                    batch_size=noise.shape[0],
+                    logit_mean=args.logit_mean,
+                    logit_std=args.logit_std,
+                    mode_scale=args.mode_scale,
+                )
+                indices = (u * num_train_timesteps).long()
+                timesteps = noise_scheduler.timesteps[indices].to(device=actions.device)
+
+                # Add noise according to flow matching.
+                # zt = (1 - texp) * x + texp * z1
+                sigmas = get_sigmas(timesteps, n_dim=actions.ndim, dtype=actions.dtype)
+                noisy_actions = (1.0 - sigmas) * actions + sigmas * noise
+
+                targets = noise - actions
+                loss_weights = compute_loss_weighting_for_sd3(
+                    weighting_scheme=args.weighting_scheme, sigmas=sigmas
+                )
+
+                outputs: Pi0GemmaForConditionalGenerationOutputWithPast = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=pixel_values,
+                    propri_states=propri_states,
+                    timesteps=timesteps,
+                    noisy_actions=noisy_actions,
+                    targets=targets,
+                    loss_weights=loss_weights,
+                    return_dict=True,
+                )
                 loss = outputs.loss
+
                 # We keep track of the loss at each epoch
                 if args.with_tracking:
                     total_loss += loss.detach().float()
@@ -887,7 +950,48 @@ def main(args: Arguments):
         losses = []
         for batch in eval_dataloader:
             with torch.no_grad():
-                outputs = model(**batch)
+                input_ids: torch.Tensor = batch["input_ids"]
+                attention_mask: torch.Tensor = batch["attention_mask"]
+                pixel_values: torch.Tensor = batch["pixel_values"]
+                propri_states: torch.Tensor = batch["propri_states"]
+                actions: torch.Tensor = batch["actions"]
+
+                # Sample noise that we'll add to the actions
+                noise = torch.randn_like(actions)
+
+                # Sample a random timestep for each sample in the batch
+                # for weighting schemes where we sample timesteps non-uniformly
+                u = compute_density_for_timestep_sampling(
+                    weighting_scheme=args.weighting_scheme,
+                    batch_size=noise.shape[0],
+                    logit_mean=args.logit_mean,
+                    logit_std=args.logit_std,
+                    mode_scale=args.mode_scale,
+                )
+                indices = (u * num_train_timesteps).long()
+                timesteps = noise_scheduler.timesteps[indices].to(device=actions.device)
+
+                # Add noise according to flow matching.
+                # zt = (1 - texp) * x + texp * z1
+                sigmas = get_sigmas(timesteps, n_dim=actions.ndim, dtype=actions.dtype)
+                noisy_actions = (1.0 - sigmas) * actions + sigmas * noise
+
+                targets = noise - actions
+                loss_weights = compute_loss_weighting_for_sd3(
+                    weighting_scheme=args.weighting_scheme, sigmas=sigmas
+                )
+
+                outputs: Pi0GemmaForConditionalGenerationOutputWithPast = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=pixel_values,
+                    propri_states=propri_states,
+                    timesteps=timesteps,
+                    noisy_actions=noisy_actions,
+                    targets=targets,
+                    loss_weights=loss_weights,
+                    return_dict=True,
+                )
 
             loss = outputs.loss
             losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))

@@ -1,6 +1,7 @@
 from typing import Union, TypedDict
 
 import torch
+import torch.nn.functional as F
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, is_valid_image
 from transformers.models.gemma import GemmaTokenizer
@@ -275,3 +276,71 @@ class Pi0GemmaProcessor(ProcessorMixin):
             return_data.update({"labels": labels})
 
         return BatchFeature(data=return_data)
+
+    def prepare_for_traning_sample(
+        self,
+        images: torch.Tensor,
+        instruction: str,
+        propri_states: torch.Tensor,
+        actions: torch.Tensor,
+        max_length: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        pixel_values = self.image_processor(images)["pixel_values"]
+        pixel_values = torch.stack(
+            [torch.from_numpy(x) for x in pixel_values],
+            dim=0,
+        )
+
+        prompt = build_string_from_input(
+            prompt=instruction,
+            bos_token=self.tokenizer.bos_token,
+            image_seq_len=self.image_seq_length,
+            image_token=IMAGE_TOKEN,
+            num_images=len(images),
+        )
+
+        inputs = self.tokenizer(
+            prompt,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+
+        return {
+            "input_ids": inputs["input_ids"][0],
+            "attention_mask": inputs["attention_mask"][0],
+            "pixel_values": pixel_values,
+            "propri_states": propri_states,
+            "actions": actions,
+        }
+
+    def collate(self, samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        batch: dict[str, list[torch.Tensor]] = {}
+
+        for sample in samples:
+            for key, value in sample.items():
+                if key not in batch:
+                    batch[key] = []
+                batch[key].append(value)
+
+        max_length = max(x.shape[0] for x in batch["input_ids"])
+        for key, value in batch.items():
+            if key in ["input_ids", "attention_mask"]:
+                if key == "input_ids":
+                    pad_value = self.tokenizer.pad_token_id
+                else:
+                    pad_value = 0
+
+                batch[key] = torch.stack(
+                    [
+                        F.pad(x, (0, max_length - x.shape[0]), mode="constant", value=pad_value)
+                        for x in value
+                    ],
+                    dim=0,
+                )
+            elif key in ["pixel_values", "propri_states", "actions"]:
+                batch[key] = torch.stack(value, dim=0)
+            else:
+                raise ValueError(f"Unknown key: {key}")
+
+        return batch

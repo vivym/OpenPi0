@@ -4,6 +4,8 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 
+from open_pi0.models.pi0_gemma import Pi0GemmaProcessor
+
 
 class CalvinH5Dataset(Dataset):
     def __init__(
@@ -15,6 +17,7 @@ class CalvinH5Dataset(Dataset):
         image_size: int = 224,
         repeat: int = 1,
         training: bool = True,
+        preprocessor: Pi0GemmaProcessor = None,
     ):
         super().__init__()
 
@@ -24,6 +27,7 @@ class CalvinH5Dataset(Dataset):
         self.use_relative_actions = use_relative_actions
         self.repeat = repeat
         self.training = training
+        self.preprocessor = preprocessor
 
         self.episode_padding_left = max(0, self.obs_seq_len - 1)
         self.episode_padding_right = max(0, self.action_seq_len - 1)
@@ -94,7 +98,8 @@ class CalvinH5Dataset(Dataset):
         ep_index = index % len(self.ep_start_end_ids)
 
         lang_group = self.h5_file["lang"]
-        text = lang_group["text"][ep_index].decode("utf-8")
+        text_bytes: bytes = lang_group["text"][ep_index]
+        text = text_bytes.decode("utf-8")
 
         ep_start_idx, ep_end_idx = self.ep_start_end_ids[ep_index]
         horizon_indices = self.sample_horizon_indices(ep_start_idx, ep_end_idx, index)
@@ -120,11 +125,14 @@ class CalvinH5Dataset(Dataset):
         for obs_name in ["rgb_static", "rgb_gripper"]:
             obs_data = obs_group[obs_name][obs_indices_uniq]
             obs_data = obs_data[obs_indices_inv]
-            obs_tensor = torch.from_numpy(obs_data).to(torch.float32)
 
-            obs_tensor.div_(255.0)
-            obs_tensor = obs_tensor.permute(0, 3, 1, 2)
-            obs_tensor = self.transform(obs_tensor)
+            if self.preprocessor is None:
+                obs_tensor = torch.from_numpy(obs_data).to(torch.float32)
+                obs_tensor.div_(255.0)
+                obs_tensor = obs_tensor.permute(0, 3, 1, 2)
+                obs_tensor = self.transform(obs_tensor)
+            else:
+                obs_tensor = obs_data
 
             obs[obs_name] = obs_tensor
 
@@ -132,8 +140,20 @@ class CalvinH5Dataset(Dataset):
         robot_obs = robot_obs[obs_indices_inv]
         obs["robot_obs"] = torch.from_numpy(robot_obs).to(torch.float32)
 
-        return {
-            "instruction": text,
-            "obs": obs,
-            "actions": actions,
-        }
+        if self.preprocessor is not None:
+            images = [x for x in obs["rgb_static"]]
+            images += [x for x in obs["rgb_gripper"]]
+
+            return self.preprocessor.prepare_for_traning_sample(
+                images=images,
+                instruction=text,
+                propri_states=obs["robot_obs"][-1:],
+                actions=actions,
+                max_length=2048,    # TODO: make this a parameter
+            )
+        else:
+            return {
+                "instruction": text,
+                "obs": obs,
+                "actions": actions,
+            }
