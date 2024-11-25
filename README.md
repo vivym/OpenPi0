@@ -17,3 +17,21 @@ cd OpenPi0
 
 pip install -v -e .
 ```
+
+## Training
+
+```bash
+accelerate launch scripts/train_pi0_gemma.py \
+    --with_tracking \
+    --report_to=wandb \
+    --mixed_precision=bf16 \
+    --num_train_epochs=500 \
+    --per_device_train_batch_size=16 \
+    --per_device_eval_batch_size=16 \
+    --checkpointing_steps=5000 \
+    --learning_rate=0.00001 \
+    --lr_scheduler=cosine \
+    --lr_warmup_steps=5000 \
+    --lr_warmup_steps_action=500 \
+    --weighting_scheme=logit_normal
+```

@@ -9,6 +9,10 @@ from open_pi0.models.pi0_gemma import (
     Pi0GemmaProcessor,
 )
 
+def is_action_expert_param(name: str) -> bool:
+    # TODO: This is a temporary solution to filter out the action expert parameters.
+    return "action_" in name or "_action" in name or "state_proj." in name
+
 
 def main():
     noise_scheduler = FlowMatchEulerDiscreteScheduler(
@@ -79,6 +83,12 @@ def main():
         assert "action_" in key or "_action" in key, key
 
     model.save_pretrained("weights/pi0gemma-3b-mix-224-initial")
+
+    print("Action expert parameters:")
+
+    for name, param in model.named_parameters():
+        if is_action_expert_param(name):
+            print(name, param.shape)
 
 
 if __name__ == "__main__":

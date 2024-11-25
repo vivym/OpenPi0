@@ -12,7 +12,6 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
-from diffusers.optimization import get_scheduler
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 from diffusers.utils import is_wandb_available
@@ -28,8 +27,14 @@ from open_pi0.models.pi0_gemma import (
     Pi0GemmaForConditionalGeneration,
     Pi0GemmaForConditionalGenerationOutputWithPast,
 )
+from open_pi0.optimization import get_scheduler
 
 logger = get_logger(__name__)
+
+
+def is_action_expert_param(name: str) -> bool:
+    # TODO: This is a temporary solution to filter out the action expert parameters.
+    return "action_" in name or "_action" in name or "state_proj." in name
 
 
 @dataclass
@@ -106,6 +111,9 @@ class Arguments:
     # Number of steps for the warmup in the lr scheduler.
     lr_warmup_steps: int = 0
 
+    # Number of warmup steps for the action-expert module.
+    lr_warmup_steps_action: int = 0
+
     # Number of hard resets of the lr in cosine_with_restarts scheduler.
     lr_num_cycles: int = 1
 
@@ -154,6 +162,9 @@ class Arguments:
 
     # If the training should continue from a checkpoint folder.
     resume_from_checkpoint: str | None = None
+
+    # Number of steps to wait before logging training metrics.
+    logging_steps: int = 50
 
     # Whether to enable experiment trackers for logging.
     with_tracking: bool = False
@@ -349,6 +360,13 @@ def parse_args(input_args=None) -> Arguments:
     )
 
     parser.add_argument(
+        "--lr_warmup_steps_action",
+        type=int,
+        default=0,
+        help="Number of warmup steps for the action-expert module.",
+    )
+
+    parser.add_argument(
         "--lr_num_cycles",
         type=int,
         default=1,
@@ -450,6 +468,13 @@ def parse_args(input_args=None) -> Arguments:
         type=str,
         default=None,
         help="If the training should continue from a checkpoint folder.",
+    )
+
+    parser.add_argument(
+        "--logging_steps",
+        type=int,
+        default=50,
+        help="Number of steps to wait before logging training metrics.",
     )
 
     parser.add_argument(
@@ -626,23 +651,23 @@ def main(args: Arguments):
 
     if args.dataset_name == "CALVIN":
         train_dataset = CalvinH5Dataset(
-            root_path="data/CALVIN/calvin_debug_dataset/training.h5",
-            obs_seq_len=2,
+            root_path="data/CALVIN/task_ABCD_D/training.h5",
+            obs_seq_len=1,
             action_seq_len=64,
             use_relative_actions=True,
             image_size=224,
-            repeat=10,
+            repeat=1,
             training=True,
             preprocessor=preprocessor,
         )
 
         eval_dataset = CalvinH5Dataset(
-            root_path="data/CALVIN/calvin_debug_dataset/validation.h5",
-            obs_seq_len=2,
+            root_path="data/CALVIN/task_ABCD_D/validation.h5",
+            obs_seq_len=1,
             action_seq_len=64,
             use_relative_actions=True,
             image_size=224,
-            repeat=10,
+            repeat=1,
             training=False,
             preprocessor=preprocessor,
         )
@@ -710,11 +735,35 @@ def main(args: Arguments):
     no_decay = ["bias", "layer_norm.weight"]
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if not any(nd in n for nd in no_decay) and not is_action_expert_param(n)
+            ],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if any(nd in n for nd in no_decay) and not is_action_expert_param(n)
+            ],
+            "weight_decay": 0.0,
+        },
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if not any(nd in n for nd in no_decay) and is_action_expert_param(n)
+            ],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if any(nd in n for nd in no_decay) and is_action_expert_param(n)
+            ],
             "weight_decay": 0.0,
         },
     ]
@@ -734,6 +783,7 @@ def main(args: Arguments):
 
         optimizer = optimizer_class(
             optimizer_grouped_parameters,
+            lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             eps=args.adam_epsilon,
         )
@@ -753,6 +803,7 @@ def main(args: Arguments):
 
         optimizer = optimizer_class(
             optimizer_grouped_parameters,
+            lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             beta3=args.prodigy_beta3,
             eps=args.adam_epsilon,
@@ -771,7 +822,12 @@ def main(args: Arguments):
     lr_scheduler: LRScheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_warmup_steps=[
+            args.lr_warmup_steps * accelerator.num_processes,
+            args.lr_warmup_steps * accelerator.num_processes,
+            args.lr_warmup_steps_action * accelerator.num_processes,
+            args.lr_warmup_steps_action * accelerator.num_processes,
+        ],
         num_training_steps=args.max_train_steps * accelerator.num_processes,    # TODO: check if this is correct
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
@@ -870,7 +926,8 @@ def main(args: Arguments):
         model.train()
 
         if args.with_tracking:
-            total_loss = 0
+            total_loss = 0.0
+            loss_denominator = 0
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
             # We skip the first `n` batches in the dataloader when resuming from a checkpoint
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
@@ -884,6 +941,9 @@ def main(args: Arguments):
                 pixel_values: torch.Tensor = batch["pixel_values"]
                 propri_states: torch.Tensor = batch["propri_states"]
                 actions: torch.Tensor = batch["actions"]
+
+                pixel_values = pixel_values.to(dtype=weight_dtype)
+                propri_states = propri_states.to(dtype=weight_dtype)
 
                 # Sample noise that we'll add to the actions
                 noise = torch.randn_like(actions)
@@ -904,6 +964,7 @@ def main(args: Arguments):
                 # zt = (1 - texp) * x + texp * z1
                 sigmas = get_sigmas(timesteps, n_dim=actions.ndim, dtype=actions.dtype)
                 noisy_actions = (1.0 - sigmas) * actions + sigmas * noise
+                noisy_actions = noisy_actions.to(dtype=weight_dtype)
 
                 targets = noise - actions
                 loss_weights = compute_loss_weighting_for_sd3(
@@ -926,7 +987,12 @@ def main(args: Arguments):
                 # We keep track of the loss at each epoch
                 if args.with_tracking:
                     total_loss += loss.detach().float()
+                    loss_denominator += 1
                 accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = [p for p in model.parameters() if p.requires_grad]
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -942,6 +1008,29 @@ def main(args: Arguments):
                     if args.output_dir is not None:
                         output_dir = os.path.join(args.output_dir, output_dir)
                     accelerator.save_state(output_dir)
+                    logger.info(f"Saved state to {output_dir}")
+
+            if (
+                args.with_tracking and
+                completed_steps % args.logging_steps == 0 and
+                accelerator.sync_gradients and
+                torch.is_tensor(total_loss)
+            ):
+                total_losses = accelerator.gather(total_loss.repeat(args.per_device_train_batch_size))
+                total_loss = torch.mean(total_losses) / loss_denominator
+
+                accelerator.log(
+                    {
+                        "train_loss": total_loss,
+                        "learning_rate": lr_scheduler.get_last_lr()[0],
+                        "epoch": epoch,
+                        "step": completed_steps,
+                    },
+                    step=completed_steps,
+                )
+
+                total_loss = 0.0
+                loss_denominator = 0
 
             if completed_steps >= args.max_train_steps:
                 break
@@ -955,6 +1044,9 @@ def main(args: Arguments):
                 pixel_values: torch.Tensor = batch["pixel_values"]
                 propri_states: torch.Tensor = batch["propri_states"]
                 actions: torch.Tensor = batch["actions"]
+
+                pixel_values = pixel_values.to(dtype=weight_dtype)
+                propri_states = propri_states.to(dtype=weight_dtype)
 
                 # Sample noise that we'll add to the actions
                 noise = torch.randn_like(actions)
@@ -975,6 +1067,7 @@ def main(args: Arguments):
                 # zt = (1 - texp) * x + texp * z1
                 sigmas = get_sigmas(timesteps, n_dim=actions.ndim, dtype=actions.dtype)
                 noisy_actions = (1.0 - sigmas) * actions + sigmas * noise
+                noisy_actions = noisy_actions.to(dtype=weight_dtype)
 
                 targets = noise - actions
                 loss_weights = compute_loss_weighting_for_sd3(
@@ -997,20 +1090,14 @@ def main(args: Arguments):
             losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
 
         losses = torch.cat(losses)
-        try:
-            eval_loss = torch.mean(losses)
-            perplexity = math.exp(eval_loss)
-        except OverflowError:
-            perplexity = float("inf")
+        eval_loss = torch.mean(losses)
 
-        logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
+        logger.info(f"epoch {epoch}, eval_loss: {eval_loss}")
 
         if args.with_tracking:
             accelerator.log(
                 {
-                    "perplexity": perplexity,
                     "eval_loss": eval_loss,
-                    "train_loss": total_loss.item() / len(train_dataloader),
                     "epoch": epoch,
                     "step": completed_steps,
                 },
@@ -1058,8 +1145,6 @@ def main(args: Arguments):
                     commit_message="End of training",
                     repo_type="model",
                 )
-            with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-                json.dump({"perplexity": perplexity}, f)
 
 
 if __name__ == "__main__":

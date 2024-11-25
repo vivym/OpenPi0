@@ -722,7 +722,7 @@ class Pi0GemmaDecoderLayer(nn.Module):
             hidden_activation=config.hidden_activation,
         )
 
-        self.action_mlp = GemmaMLP(
+        self.mlp_action = GemmaMLP(
             hidden_size=config.action_config.hidden_size,
             intermediate_size=config.action_config.intermediate_size,
             hidden_activation=config.action_config.hidden_activation,
@@ -796,7 +796,7 @@ class Pi0GemmaDecoderLayer(nn.Module):
         if action_hidden_states is not None:
             residual_action = action_hidden_states
             action_hidden_states = self.post_attention_layernorm_action(action_hidden_states)
-            action_hidden_states = self.action_mlp(action_hidden_states)
+            action_hidden_states = self.mlp_action(action_hidden_states)
             action_hidden_states = residual_action + action_hidden_states
 
         outputs = ((hidden_states, action_hidden_states),)
@@ -1286,7 +1286,7 @@ class TimestepConditionedMLP(nn.Module):
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         x = self.fc1(x)
-        t_emb = t_emb[:, None, :].expand(-1, x.size(1), -1)
+        t_emb = t_emb[:, None, :].expand(-1, x.shape[1], -1)
         x = torch.cat([x, t_emb], dim=-1)
         x = self.fc2(x)
         x = F.selu_(x)
@@ -1523,7 +1523,8 @@ class Pi0GemmaForConditionalGeneration(Pi0GemmaPreTrainedModel, GenerationMixin)
             assert propri_states is not None, "`propri_states` must be provided when `timesteps` is provided"
             assert noisy_actions is not None, "`noisy_actions` must be provided when `timesteps` is provided"
 
-            t_emb = self.time_proj(timesteps)
+            t_emb: torch.Tensor = self.time_proj(timesteps)
+            t_emb = t_emb.to(propri_states.dtype)
 
             state_embeds = self.state_proj(propri_states, t_emb=t_emb)
 
@@ -1553,17 +1554,17 @@ class Pi0GemmaForConditionalGeneration(Pi0GemmaPreTrainedModel, GenerationMixin)
         if timesteps is not None:
             action_hidden_states: torch.Tensor = outputs[1]
 
-            model_pred = self.action_head(action_hidden_states[:, 1:])
+            model_pred: torch.Tensor = self.action_head(action_hidden_states[:, 1:])
 
             loss = None
             if targets is not None:
                 if loss_weights is not None:
-                    loss = F.mse_loss(model_pred, targets, reduction="none")
+                    loss = F.mse_loss(model_pred.float(), targets.float(), reduction="none")
                     loss = loss_weights.float() * loss
                     loss = loss.reshape(targets.shape[0], -1).mean(1)
                     loss = loss.mean()
                 else:
-                    loss = F.mse_loss(model_pred, targets)
+                    loss = F.mse_loss(model_pred.float(), targets.float())
         else:
             raise NotImplementedError
 
