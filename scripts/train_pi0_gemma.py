@@ -1022,7 +1022,8 @@ def main(args: Arguments):
                 accelerator.log(
                     {
                         "train_loss": total_loss,
-                        "learning_rate": lr_scheduler.get_last_lr()[0],
+                        "lr_lm": lr_scheduler.get_last_lr()[0],
+                        "lr_action": lr_scheduler.get_last_lr()[2],
                         "epoch": epoch,
                         "step": completed_steps,
                     },
@@ -1095,14 +1096,7 @@ def main(args: Arguments):
         logger.info(f"epoch {epoch}, eval_loss: {eval_loss}")
 
         if args.with_tracking:
-            accelerator.log(
-                {
-                    "eval_loss": eval_loss,
-                    "epoch": epoch,
-                    "step": completed_steps,
-                },
-                step=completed_steps,
-            )
+            accelerator.log({"eval_loss": eval_loss}, step=completed_steps)
 
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
