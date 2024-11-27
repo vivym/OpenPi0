@@ -378,13 +378,13 @@ class GemmaAttention(nn.Module):
             attn_weights = attn_weights + causal_mask
 
         # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        if attn_output.size() != (bsz, self.num_heads, q_len + a_len, self.head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len + a_len, self.head_dim)}, but is"
                 f" {attn_output.size()}"
             )
 
@@ -1397,6 +1397,7 @@ class Pi0GemmaForConditionalGeneration(Pi0GemmaPreTrainedModel, GenerationMixin)
         causal_mask = causal_mask[None, None, :, :].expand(inputs_embeds.shape[0], 1, -1, -1)
 
         if attention_mask is not None:
+            # TODO: Check if this is correct
             # TODO: optimize this
 
             attention_mask = attention_mask[:, None, :, None] * attention_mask[:, None, None, :]
@@ -1556,7 +1557,6 @@ class Pi0GemmaForConditionalGeneration(Pi0GemmaPreTrainedModel, GenerationMixin)
 
             model_pred: torch.Tensor = self.action_head(action_hidden_states[:, 1:])
 
-            loss = None
             if targets is not None:
                 if loss_weights is not None:
                     loss = F.mse_loss(model_pred.float(), targets.float(), reduction="none")
@@ -1565,6 +1565,8 @@ class Pi0GemmaForConditionalGeneration(Pi0GemmaPreTrainedModel, GenerationMixin)
                     loss = loss.mean()
                 else:
                     loss = F.mse_loss(model_pred.float(), targets.float())
+            else:
+                loss = None
         else:
             raise NotImplementedError
 

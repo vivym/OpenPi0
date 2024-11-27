@@ -1,9 +1,9 @@
 import argparse
-import json
 import logging
 import math
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import diffusers
@@ -13,7 +13,6 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 from diffusers.utils import is_wandb_available
 from diffusers.utils.torch_utils import is_compiled_module
 from huggingface_hub import create_repo, upload_folder
@@ -35,6 +34,66 @@ logger = get_logger(__name__)
 def is_action_expert_param(name: str) -> bool:
     # TODO: This is a temporary solution to filter out the action expert parameters.
     return "action_" in name or "_action" in name or "state_proj." in name
+
+
+@lru_cache()
+def get_beta_distribution(batch_size: int, alpha: float, beta: float, device: str = "cpu"):
+    """
+    Get a beta distribution with the given alpha and beta parameters.
+    """
+    alpha_tensor = torch.full((batch_size,), alpha, device=device)
+    beta_tensor = torch.full((batch_size,), beta, device=device)
+    return torch.distributions.beta.Beta(alpha_tensor, beta_tensor)
+
+
+def compute_density_for_timestep_sampling(
+    weighting_scheme: str,
+    batch_size: int,
+    logit_mean: float = None,
+    logit_std: float = None,
+    mode_scale: float = None,
+    beta_alpha: float = None,
+    beta_beta: float = None,
+    beta_cutoff: float = None,
+):
+    """
+    Compute the density for sampling the timesteps when doing flow matching training.
+
+    SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+    """
+    if weighting_scheme == "logit_normal":
+        # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
+        u = torch.normal(mean=logit_mean, std=logit_std, size=(batch_size,), device="cpu")
+        u = torch.nn.functional.sigmoid(u)
+    elif weighting_scheme == "mode":
+        u = torch.rand(size=(batch_size,), device="cpu")
+        u = 1 - u - mode_scale * (torch.cos(math.pi * u / 2) ** 2 - 1 + u)
+    elif weighting_scheme == "neg_beta":
+        beta_dist = get_beta_distribution(batch_size, beta_alpha, beta_beta)
+        u = beta_dist.sample()
+        u = beta_cutoff * (1 - u)
+    else:
+        u = torch.rand(size=(batch_size,), device="cpu")
+    return u
+
+
+def compute_loss_weighting_for_flow_matching(
+    weighting_scheme: str,
+    sigmas=None,
+):
+    """
+    Computes loss weighting scheme for flow matching training.
+
+    SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+    """
+    if weighting_scheme == "sigma_sqrt":
+        weighting = (sigmas**-2.0).float()
+    elif weighting_scheme == "cosmap":
+        bot = 1 - 2 * sigmas + 2 * sigmas**2
+        weighting = 2 / (math.pi * bot)
+    else:
+        weighting = torch.ones_like(sigmas)
+    return weighting
 
 
 @dataclass
@@ -59,6 +118,9 @@ class Arguments:
 
     # Initial learning rate (after the potential warmup period) to use.
     learning_rate: float = 1e-4
+
+    # Initial learning rate for the action-expert module.
+    learning_rate_action: float | None = None
 
     # The optimizer type to use. Choose between ["AdamW", "prodigy"]
     optimizer: str = "AdamW"
@@ -182,7 +244,7 @@ class Arguments:
     gradient_checkpointing: bool = False
 
     # We default to the "none" weighting scheme for uniform sampling and uniform loss
-    # Choose between ["sigma_sqrt", "logit_normal", "mode", "cosmap", "none"]
+    # Choose between ["sigma_sqrt", "logit_normal", "mode", "cosmap", "neg_beta", "none"]
     weighting_scheme: str = "none"
 
     # mean to use when using the `'logit_normal'` weighting scheme.
@@ -193,6 +255,15 @@ class Arguments:
 
     # Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.
     mode_scale: float = 1.29
+
+    # alpha parameter for the beta distribution. Only effective when using the `'neg_beta'` as the `weighting_scheme`.
+    beta_alpha: float = 1.5
+
+    # beta parameter for the beta distribution. Only effective when using the `'neg_beta'` as the `weighting_scheme`.
+    beta_beta: float = 1.0
+
+    # Cutoff value for the beta distribution. Only effective when using the `'neg_beta'` as the `weighting_scheme`.
+    beta_cutoff: float = 0.999
 
     # [TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to
     # *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***.
@@ -257,6 +328,13 @@ def parse_args(input_args=None) -> Arguments:
         type=float,
         default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
+    )
+
+    parser.add_argument(
+        "--learning_rate_action",
+        type=float,
+        default=None,
+        help="Initial learning rate for the action-expert module.",
     )
 
     parser.add_argument(
@@ -513,7 +591,7 @@ def parse_args(input_args=None) -> Arguments:
         "--weighting_scheme",
         type=str,
         default="none",
-        choices=["sigma_sqrt", "logit_normal", "mode", "cosmap", "none"],
+        choices=["sigma_sqrt", "logit_normal", "mode", "cosmap", "neg_beta", "none"],
         help=('We default to the "none" weighting scheme for uniform sampling and uniform loss'),
     )
 
@@ -530,6 +608,27 @@ def parse_args(input_args=None) -> Arguments:
         type=float,
         default=1.29,
         help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
+    )
+
+    parser.add_argument(
+        "--beta_alpha",
+        type=float,
+        default=1.5,
+        help="alpha parameter for the beta distribution. Only effective when using the `'neg_beta'` as the `weighting_scheme`.",
+    )
+
+    parser.add_argument(
+        "--beta_beta",
+        type=float,
+        default=1.0,
+        help="beta parameter for the beta distribution. Only effective when using the `'neg_beta'` as the `weighting_scheme`.",
+    )
+
+    parser.add_argument(
+        "--beta_cutoff",
+        type=float,
+        default=0.999,
+        help="Cutoff value for the beta distribution. Only effective when using the `'neg_beta'` as the `weighting_scheme`.",
     )
 
     parser.add_argument(
@@ -704,6 +803,8 @@ def main(args: Arguments):
         variant=args.variant,
     )
 
+    model.requires_grad_(True)
+
     # For mixed precision training we cast all non-trainable weights to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
@@ -714,11 +815,6 @@ def main(args: Arguments):
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
-
-    def unwrap_model(model) -> Pi0GemmaForConditionalGeneration:
-        model = accelerator.unwrap_model(model)
-        model = model._orig_mod if is_compiled_module(model) else model
-        return model
 
     if torch.backends.mps.is_available() and weight_dtype == torch.bfloat16:
         # due to pytorch#99272, MPS does not yet support bfloat16.
@@ -731,6 +827,9 @@ def main(args: Arguments):
     if args.allow_tf32 and torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
 
+    if args.learning_rate_action is None:
+        args.learning_rate_action = args.learning_rate
+
     # Split weights in two groups, one with weight decay and the other not.
     no_decay = ["bias", "layer_norm.weight"]
     optimizer_grouped_parameters = [
@@ -740,6 +839,7 @@ def main(args: Arguments):
                 for n, p in model.named_parameters()
                 if not any(nd in n for nd in no_decay) and not is_action_expert_param(n)
             ],
+            "lr": args.learning_rate,
             "weight_decay": args.weight_decay,
         },
         {
@@ -748,6 +848,7 @@ def main(args: Arguments):
                 for n, p in model.named_parameters()
                 if any(nd in n for nd in no_decay) and not is_action_expert_param(n)
             ],
+            "lr": args.learning_rate,
             "weight_decay": 0.0,
         },
         {
@@ -756,6 +857,7 @@ def main(args: Arguments):
                 for n, p in model.named_parameters()
                 if not any(nd in n for nd in no_decay) and is_action_expert_param(n)
             ],
+            "lr": args.learning_rate_action,
             "weight_decay": args.weight_decay,
         },
         {
@@ -764,6 +866,7 @@ def main(args: Arguments):
                 for n, p in model.named_parameters()
                 if any(nd in n for nd in no_decay) and is_action_expert_param(n)
             ],
+            "lr": args.learning_rate_action,
             "weight_decay": 0.0,
         },
     ]
@@ -783,7 +886,6 @@ def main(args: Arguments):
 
         optimizer = optimizer_class(
             optimizer_grouped_parameters,
-            lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             eps=args.adam_epsilon,
         )
@@ -803,7 +905,6 @@ def main(args: Arguments):
 
         optimizer = optimizer_class(
             optimizer_grouped_parameters,
-            lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             beta3=args.prodigy_beta3,
             eps=args.adam_epsilon,
@@ -828,7 +929,11 @@ def main(args: Arguments):
             args.lr_warmup_steps_action * accelerator.num_processes,
             args.lr_warmup_steps_action * accelerator.num_processes,
         ],
-        num_training_steps=args.max_train_steps * accelerator.num_processes,    # TODO: check if this is correct
+        num_training_steps=(
+            args.max_train_steps
+            if overrode_max_train_steps
+            else args.max_train_steps * accelerator.num_processes
+        ),
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
@@ -873,7 +978,11 @@ def main(args: Arguments):
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(
+        range(args.max_train_steps),
+        desc="Steps",
+        disable=not accelerator.is_local_main_process
+    )
     completed_steps = 0
     starting_epoch = 0
 
@@ -908,6 +1017,11 @@ def main(args: Arguments):
 
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
+
+    def unwrap_model(model) -> Pi0GemmaForConditionalGeneration:
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
 
     def get_sigmas(timesteps: torch.Tensor, n_dim=4, dtype=torch.float32) -> torch.Tensor:
         sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=dtype)
@@ -967,7 +1081,7 @@ def main(args: Arguments):
                 noisy_actions = noisy_actions.to(dtype=weight_dtype)
 
                 targets = noise - actions
-                loss_weights = compute_loss_weighting_for_sd3(
+                loss_weights = compute_loss_weighting_for_flow_matching(
                     weighting_scheme=args.weighting_scheme, sigmas=sigmas
                 )
 
@@ -1040,6 +1154,7 @@ def main(args: Arguments):
         losses = []
         for batch in eval_dataloader:
             with torch.no_grad():
+                # TODO: refactor this to a function
                 input_ids: torch.Tensor = batch["input_ids"]
                 attention_mask: torch.Tensor = batch["attention_mask"]
                 pixel_values: torch.Tensor = batch["pixel_values"]
@@ -1071,7 +1186,7 @@ def main(args: Arguments):
                 noisy_actions = noisy_actions.to(dtype=weight_dtype)
 
                 targets = noise - actions
-                loss_weights = compute_loss_weighting_for_sd3(
+                loss_weights = compute_loss_weighting_for_flow_matching(
                     weighting_scheme=args.weighting_scheme, sigmas=sigmas
                 )
 

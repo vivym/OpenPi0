@@ -1,5 +1,6 @@
 from typing import Union, TypedDict
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers.feature_extraction_utils import BatchFeature
@@ -279,10 +280,10 @@ class Pi0GemmaProcessor(ProcessorMixin):
 
     def prepare_for_traning_sample(
         self,
-        images: torch.Tensor,
+        images: list[np.ndarray],
         instruction: str,
         propri_states: torch.Tensor,
-        actions: torch.Tensor,
+        actions: torch.Tensor | None = None,
         max_length: int | None = None,
     ) -> dict[str, torch.Tensor]:
         pixel_values = self.image_processor(images)["pixel_values"]
@@ -325,6 +326,10 @@ class Pi0GemmaProcessor(ProcessorMixin):
 
         max_length = max(x.shape[0] for x in batch["input_ids"])
         for key, value in batch.items():
+            if any(x is None for x in value):
+                logger.warning(f"Skipping key: {key}")
+                continue
+
             if key in ["input_ids", "attention_mask"]:
                 if key == "input_ids":
                     pad_value = self.tokenizer.pad_token_id

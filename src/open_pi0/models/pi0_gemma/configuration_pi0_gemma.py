@@ -12,7 +12,7 @@ class Pi0GemmaActionExpertConfig(PretrainedConfig):
         hidden_activation: str = "gelu_pytorch_tanh",
         state_dim: int = 15,
         action_horizon: int = 64,
-        action_dim: int = 18,
+        action_dim: int = 7,
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -34,7 +34,7 @@ class Pi0GemmaConfig(PretrainedConfig):
         vision_config=None,
         action_config=None,
         image_token_index=257152,
-        vocab_size=257152,
+        vocab_size=257216,
         hidden_size=2048,
         intermediate_size=16384,
         num_hidden_layers=18,

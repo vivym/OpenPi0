@@ -18,6 +18,7 @@ class CalvinH5Dataset(Dataset):
         repeat: int = 1,
         training: bool = True,
         preprocessor: Pi0GemmaProcessor = None,
+        uncond_prob: float = 0.2,
     ):
         super().__init__()
 
@@ -25,9 +26,11 @@ class CalvinH5Dataset(Dataset):
         self.obs_seq_len = obs_seq_len
         self.action_seq_len = action_seq_len
         self.use_relative_actions = use_relative_actions
+        self.image_size = image_size
         self.repeat = repeat
         self.training = training
         self.preprocessor = preprocessor
+        self.uncond_prob = uncond_prob
 
         self.episode_padding_left = max(0, self.obs_seq_len - 1)
         self.episode_padding_right = max(0, self.action_seq_len - 1)
@@ -97,48 +100,83 @@ class CalvinH5Dataset(Dataset):
     def __getitem__(self, index: int):
         ep_index = index % len(self.ep_start_end_ids)
 
-        lang_group = self.h5_file["lang"]
-        text_bytes: bytes = lang_group["text"][ep_index]
-        text = text_bytes.decode("utf-8")
+        if self.training and np.random.rand() < self.uncond_prob:
+            uncond = True
+        else:
+            uncond = False
+
+        if uncond:
+            text = ""
+        else:
+            lang_group = self.h5_file["lang"]
+            text_bytes: bytes = lang_group["text"][ep_index]
+            text = text_bytes.decode("utf-8")
 
         ep_start_idx, ep_end_idx = self.ep_start_end_ids[ep_index]
         horizon_indices = self.sample_horizon_indices(ep_start_idx, ep_end_idx, index)
 
-        obs_indices = horizon_indices[:self.obs_seq_len]
-        action_indices = horizon_indices[self.obs_seq_len - 1:]
+        action_group = self.h5_file["action"]
+        actions_key = "rel_actions" if self.use_relative_actions else "actions"
 
+        if uncond:
+            action_dim = action_group[actions_key].shape[-1]
+            actions = torch.zeros(self.action_seq_len, action_dim, dtype=torch.float32)
+        else:
+            action_indices = horizon_indices[self.obs_seq_len - 1:]
+            action_indices_uniq, action_indices_inv = np.unique(action_indices, return_inverse=True)
+            action_indices_uniq = action_indices_uniq.tolist()
+
+            actions_array = action_group[actions_key][action_indices_uniq]
+            actions = torch.from_numpy(actions_array).to(torch.float32)
+            actions = actions[action_indices_inv]
+
+        obs_indices = horizon_indices[:self.obs_seq_len]
         obs_indices_uniq, obs_indices_inv = np.unique(obs_indices, return_inverse=True)
         obs_indices_uniq = obs_indices_uniq.tolist()
-        action_indices_uniq, action_indices_inv = np.unique(action_indices, return_inverse=True)
-        action_indices_uniq = action_indices_uniq.tolist()
-
-        action_group = self.h5_file["action"]
-
-        actions_key = "rel_actions" if self.use_relative_actions else "actions"
-        actions_array = action_group[actions_key][action_indices_uniq]
-        actions = torch.from_numpy(actions_array).to(torch.float32)
-        actions = actions[action_indices_inv]
 
         obs_group = self.h5_file["obs"]
-
         obs = {}
-        for obs_name in ["rgb_static", "rgb_gripper"]:
-            obs_data = obs_group[obs_name][obs_indices_uniq]
-            obs_data = obs_data[obs_indices_inv]
 
+        if uncond:
             if self.preprocessor is None:
-                obs_tensor = torch.from_numpy(obs_data).to(torch.float32)
-                obs_tensor.div_(255.0)
-                obs_tensor = obs_tensor.permute(0, 3, 1, 2)
-                obs_tensor = self.transform(obs_tensor)
+                rgb_static = torch.zeros(
+                    self.obs_seq_len, 3, self.image_size, self.image_size, dtype=torch.float32
+                )
+                rgb_gripper = torch.zeros(
+                    self.obs_seq_len, 3, self.image_size, self.image_size, dtype=torch.float32
+                )
             else:
-                obs_tensor = obs_data
+                rgb_static_shape = tuple(obs_group["rgb_static"].shape[1:])
+                rgb_static = np.zeros((self.obs_seq_len,) + rgb_static_shape, dtype=np.uint8)
+                rgb_gripper_shape = tuple(obs_group["rgb_gripper"].shape[1:])
+                rgb_gripper = np.zeros((self.obs_seq_len,) + rgb_gripper_shape, dtype=np.uint8)
 
-            obs[obs_name] = obs_tensor
+            robot_obs_dim = obs_group["robot_obs"].shape[-1]
+            robot_obs = torch.zeros(self.obs_seq_len, robot_obs_dim, dtype=torch.float32)
 
-        robot_obs = obs_group["robot_obs"][obs_indices_uniq]
-        robot_obs = robot_obs[obs_indices_inv]
-        obs["robot_obs"] = torch.from_numpy(robot_obs).to(torch.float32)
+            obs = {
+                "rgb_static": rgb_static,
+                "rgb_gripper": rgb_gripper,
+                "robot_obs": robot_obs,
+            }
+        else:
+            for obs_name in ["rgb_static", "rgb_gripper"]:
+                obs_data = obs_group[obs_name][obs_indices_uniq]
+                obs_data = obs_data[obs_indices_inv]
+
+                if self.preprocessor is None:
+                    obs_tensor = torch.from_numpy(obs_data).to(torch.float32)
+                    obs_tensor.div_(255.0)
+                    obs_tensor = obs_tensor.permute(0, 3, 1, 2)
+                    obs_tensor = self.transform(obs_tensor)
+                else:
+                    obs_tensor = obs_data
+
+                obs[obs_name] = obs_tensor
+
+            robot_obs = obs_group["robot_obs"][obs_indices_uniq]
+            robot_obs = robot_obs[obs_indices_inv]
+            obs["robot_obs"] = torch.from_numpy(robot_obs).to(torch.float32)
 
         if self.preprocessor is not None:
             images = [x for x in obs["rgb_static"]]
