@@ -1515,9 +1515,6 @@ class Pi0GemmaForConditionalGeneration(Pi0GemmaPreTrainedModel, GenerationMixin)
                     "tokens from image embeddings."
                 )
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            # TODO: check if this is the correct way to mask the image tokens
-            # image_features: 4, 4, 256, 2048
-            # inputs_embeds: 4, 1036, 2048
             inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
 
         if timesteps is not None:
