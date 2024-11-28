@@ -13,6 +13,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from diffusers.training_utils import EMAModel
 from diffusers.utils import is_wandb_available
 from diffusers.utils.torch_utils import is_compiled_module
 from huggingface_hub import create_repo, upload_folder
@@ -277,6 +278,27 @@ class Arguments:
     # 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the
     # flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config.
     mixed_precision: str | None = None
+
+    # Whether or not to enable exponential moving average (EMA) for the model.
+    use_ema: bool = False
+
+    # Use faster foreach implementation of EMAModel.
+    foreach_ema: bool = False
+
+    # EMA decay rate.
+    ema_decay: float = 0.9999
+
+    # The number of steps to wait before starting to update the EMA weights.
+    ema_update_after_steps: int = 0
+
+    # Whether to warmup the EMA model.
+    ema_warmup: bool = False
+
+    # Inverse multiplicative factor of EMA warmup. Default: 1. Only used if `ema_warmup` is True.
+    ema_inv_gamma: float = 1.0
+
+    # Exponential factor of EMA warmup. Default: 2/3. Only used if `ema_warmup` is True.
+    ema_power: float = 2 / 3
 
 
 def parse_args(input_args=None) -> Arguments:
@@ -662,6 +684,52 @@ def parse_args(input_args=None) -> Arguments:
         ),
     )
 
+    parser.add_argument(
+        "--use_ema",
+        action="store_true",
+        help="Whether or not to enable exponential moving average (EMA) for the model.",
+    )
+
+    parser.add_argument(
+        "--foreach_ema",
+        action="store_true",
+        help="Use faster foreach implementation of EMAModel.",
+    )
+
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.9999,
+        help="EMA decay rate.",
+    )
+
+    parser.add_argument(
+        "--ema_update_after_steps",
+        type=int,
+        default=0,
+        help="The number of steps to wait before starting to update the EMA weights.",
+    )
+
+    parser.add_argument(
+        "--ema_warmup",
+        action="store_true",
+        help="Whether to warmup the EMA model.",
+    )
+
+    parser.add_argument(
+        "--ema_inv_gamma",
+        type=float,
+        default=1.0,
+        help="Inverse multiplicative factor of EMA warmup. Default: 1. Only used if `ema_warmup` is True.",
+    )
+
+    parser.add_argument(
+        "--ema_power",
+        type=float,
+        default=2 / 3,
+        help="Exponential factor of EMA warmup. Default: 2/3. Only used if `ema_warmup` is True.",
+    )
+
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -805,22 +873,25 @@ def main(args: Arguments):
 
     model.requires_grad_(True)
 
-    # For mixed precision training we cast all non-trainable weights to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-
-    if torch.backends.mps.is_available() and weight_dtype == torch.bfloat16:
-        # due to pytorch#99272, MPS does not yet support bfloat16.
-        raise ValueError(
-            "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
+    if args.use_ema:
+        model_copy: Pi0GemmaForConditionalGeneration = Pi0GemmaForConditionalGeneration.from_pretrained(
+            args.pretrained_model_name_or_path,
+            revision=args.revision,
+            variant=args.variant,
         )
+        ema_model = EMAModel(
+            model_copy.parameters(),
+            decay=args.ema_decay,
+            update_after_step=args.ema_update_after_steps,
+            use_ema_warmup=args.ema_warmup,
+            inv_gamma=args.ema_inv_gamma,
+            power=args.ema_power,
+            foreach=args.foreach_ema,
+            model_cls=Pi0GemmaForConditionalGeneration,
+            model_config=model.config,
+        )
+
+    # TODO: save/load state hooks, handle ema loading logic
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -948,6 +1019,26 @@ def main(args: Arguments):
     model: Pi0GemmaForConditionalGeneration
     optimizer: torch.optim.Optimizer
     lr_scheduler: LRScheduler
+
+    if args.use_ema:
+        ema_model = ema_model.to(accelerator.device)
+
+    # For mixed precision training we cast all non-trainable weights to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    if torch.backends.mps.is_available() and weight_dtype == torch.bfloat16:
+        # due to pytorch#99272, MPS does not yet support bfloat16.
+        raise ValueError(
+            "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
+        )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1113,6 +1204,9 @@ def main(args: Arguments):
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
+                if args.use_ema:
+                    ema_model.step(model.parameters())
+
                 progress_bar.update(1)
                 completed_steps += 1
 
@@ -1122,6 +1216,8 @@ def main(args: Arguments):
                     if args.output_dir is not None:
                         output_dir = os.path.join(args.output_dir, output_dir)
                     accelerator.save_state(output_dir)
+                    if args.use_ema and accelerator.is_main_process:
+                        ema_model.save_pretrained(os.path.join(output_dir, "ema"))
                     logger.info(f"Saved state to {output_dir}")
 
             if (
@@ -1149,6 +1245,10 @@ def main(args: Arguments):
 
             if completed_steps >= args.max_train_steps:
                 break
+
+        if args.use_ema:
+            ema_model.store(model.parameters())
+            ema_model.copy_to(model.parameters())
 
         model.eval()
         losses = []
@@ -1213,9 +1313,17 @@ def main(args: Arguments):
         if args.with_tracking:
             accelerator.log({"eval_loss": eval_loss}, step=completed_steps)
 
+        if args.use_ema:
+            ema_model.restore(model.parameters())
+
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
             unwrapped_model = unwrap_model(model)
+
+            if args.use_ema:
+                ema_model.store(unwrapped_model.parameters())
+                ema_model.copy_to(unwrapped_model.parameters())
+
             unwrapped_model.save_pretrained(
                 args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
             )
@@ -1229,11 +1337,17 @@ def main(args: Arguments):
                     repo_type="model",
                 )
 
+            if args.use_ema:
+                ema_model.restore(unwrapped_model.parameters())
+
         if args.checkpointing_steps == "epoch":
             output_dir = f"epoch_{epoch}"
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
             accelerator.save_state(output_dir)
+            if args.use_ema and accelerator.is_main_process:
+                ema_model.save_pretrained(os.path.join(output_dir, "ema"))
+            logger.info(f"Saved state to {output_dir}")
 
     if args.with_tracking:
         accelerator.end_training()
@@ -1241,6 +1355,10 @@ def main(args: Arguments):
     if args.output_dir is not None:
         accelerator.wait_for_everyone()
         unwrapped_model = unwrap_model(model)
+
+        if args.use_ema:
+            ema_model.copy_to(unwrapped_model.parameters())
+
         unwrapped_model.save_pretrained(
             args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
         )

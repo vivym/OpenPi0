@@ -105,11 +105,16 @@ def main():
         use_relative_actions=True,
         image_size=224,
         repeat=1,
-        training=True,
+        training=False,
         preprocessor=preprocessor,
     )
 
-    batch = preprocessor.collate([train_dataset[x] for x in range(4)])
+    samples = [train_dataset[x] for x in range(2)]
+    uncond_sample = [train_dataset.get_uncond_sample(x) for x in range(2)]
+
+    samples = uncond_sample + samples
+
+    batch = preprocessor.collate(samples)
 
     noise_scheduler: FlowMatchEulerDiscreteScheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         "weights/pi0gemma-3b-mix-224-initial"
@@ -131,10 +136,11 @@ def main():
     pixel_values = pixel_values.to(device=device, dtype=weight_dtype)
     propri_states = propri_states.to(device=device, dtype=weight_dtype)
     actions = actions.to(device=device)
+    actions = actions[:actions.shape[0] // 2]
 
     num_inference_steps = 50
 
-    timesteps, num_inference_steps = retrieve_timesteps(noise_scheduler, num_inference_steps, device, timesteps)
+    timesteps, num_inference_steps = retrieve_timesteps(noise_scheduler, num_inference_steps, device, None)
     num_warmup_steps = max(len(timesteps) - num_inference_steps * noise_scheduler.order, 0)
 
     pred_actions = torch.randn_like(actions)
@@ -143,7 +149,8 @@ def main():
         with tqdm(range(num_inference_steps), desc="Inference steps") as progress_bar:
             for i, t in enumerate(timesteps):
                 t: torch.Tensor
-                timestep = t.expand(actions.shape[0])
+                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                timestep = t.expand(actions.shape[0] * 2)
 
                 outputs: Pi0GemmaForConditionalGenerationOutputWithPast = model(
                     input_ids=input_ids,
@@ -151,10 +158,13 @@ def main():
                     pixel_values=pixel_values,
                     propri_states=propri_states,
                     timesteps=timestep,
-                    noisy_actions=pred_actions,
+                    noisy_actions=torch.cat([pred_actions, pred_actions], dim=0),
                     return_dict=True,
                 )
                 model_pred = outputs.model_pred
+
+                model_pred_uncond, model_pred = model_pred.chunk(2, dim=0)
+                model_pred = model_pred_uncond + 3.0 * (model_pred - model_pred_uncond)
 
                 pred_actions = noise_scheduler.step(model_pred, t, pred_actions, return_dict=False)[0]
 

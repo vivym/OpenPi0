@@ -1,3 +1,4 @@
+from accelerate.utils import set_seed
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from transformers.models.paligemma import PaliGemmaForConditionalGeneration, PaliGemmaProcessor
 from transformers.models.siglip import SiglipVisionConfig
@@ -15,6 +16,8 @@ def is_action_expert_param(name: str) -> bool:
 
 
 def main():
+    set_seed(42)
+
     noise_scheduler = FlowMatchEulerDiscreteScheduler(
         num_train_timesteps=1000,
         shift=3.0,
@@ -85,9 +88,14 @@ def main():
 
     print("Action expert parameters:")
 
+    total_params = 0
+
     for name, param in model.named_parameters():
         if is_action_expert_param(name):
             print(name, param.shape)
+            total_params += param.numel()
+
+    print(f"Total action expert parameters: {total_params}")
 
 
 if __name__ == "__main__":

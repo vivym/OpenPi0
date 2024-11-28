@@ -118,17 +118,13 @@ class CalvinH5Dataset(Dataset):
         action_group = self.h5_file["action"]
         actions_key = "rel_actions" if self.use_relative_actions else "actions"
 
-        if uncond:
-            action_dim = action_group[actions_key].shape[-1]
-            actions = torch.zeros(self.action_seq_len, action_dim, dtype=torch.float32)
-        else:
-            action_indices = horizon_indices[self.obs_seq_len - 1:]
-            action_indices_uniq, action_indices_inv = np.unique(action_indices, return_inverse=True)
-            action_indices_uniq = action_indices_uniq.tolist()
+        action_indices = horizon_indices[self.obs_seq_len - 1:]
+        action_indices_uniq, action_indices_inv = np.unique(action_indices, return_inverse=True)
+        action_indices_uniq = action_indices_uniq.tolist()
 
-            actions_array = action_group[actions_key][action_indices_uniq]
-            actions = torch.from_numpy(actions_array).to(torch.float32)
-            actions = actions[action_indices_inv]
+        actions_array = action_group[actions_key][action_indices_uniq]
+        actions = torch.from_numpy(actions_array).to(torch.float32)
+        actions = actions[action_indices_inv]
 
         obs_indices = horizon_indices[:self.obs_seq_len]
         obs_indices_uniq, obs_indices_inv = np.unique(obs_indices, return_inverse=True)
@@ -177,6 +173,68 @@ class CalvinH5Dataset(Dataset):
             robot_obs = obs_group["robot_obs"][obs_indices_uniq]
             robot_obs = robot_obs[obs_indices_inv]
             obs["robot_obs"] = torch.from_numpy(robot_obs).to(torch.float32)
+
+        if self.preprocessor is not None:
+            images = [x for x in obs["rgb_static"]]
+            images += [x for x in obs["rgb_gripper"]]
+
+            return self.preprocessor.prepare_for_traning_sample(
+                images=images,
+                instruction=text,
+                propri_states=obs["robot_obs"][-1:],
+                actions=actions,
+                max_length=2048,    # TODO: make this a parameter
+            )
+        else:
+            return {
+                "instruction": text,
+                "obs": obs,
+                "actions": actions,
+            }
+
+    def get_uncond_sample(self, index: int) -> dict:
+        ep_index = index % len(self.ep_start_end_ids)
+
+        text = ""
+
+        ep_start_idx, ep_end_idx = self.ep_start_end_ids[ep_index]
+        horizon_indices = self.sample_horizon_indices(ep_start_idx, ep_end_idx, index)
+
+        action_group = self.h5_file["action"]
+        actions_key = "rel_actions" if self.use_relative_actions else "actions"
+
+        action_indices = horizon_indices[self.obs_seq_len - 1:]
+        action_indices_uniq, action_indices_inv = np.unique(action_indices, return_inverse=True)
+        action_indices_uniq = action_indices_uniq.tolist()
+
+        actions_array = action_group[actions_key][action_indices_uniq]
+        actions = torch.from_numpy(actions_array).to(torch.float32)
+        actions = actions[action_indices_inv]
+
+        obs_group = self.h5_file["obs"]
+        obs = {}
+
+        if self.preprocessor is None:
+            rgb_static = torch.zeros(
+                self.obs_seq_len, 3, self.image_size, self.image_size, dtype=torch.float32
+            )
+            rgb_gripper = torch.zeros(
+                self.obs_seq_len, 3, self.image_size, self.image_size, dtype=torch.float32
+            )
+        else:
+            rgb_static_shape = tuple(obs_group["rgb_static"].shape[1:])
+            rgb_static = np.zeros((self.obs_seq_len,) + rgb_static_shape, dtype=np.uint8)
+            rgb_gripper_shape = tuple(obs_group["rgb_gripper"].shape[1:])
+            rgb_gripper = np.zeros((self.obs_seq_len,) + rgb_gripper_shape, dtype=np.uint8)
+
+        robot_obs_dim = obs_group["robot_obs"].shape[-1]
+        robot_obs = torch.zeros(self.obs_seq_len, robot_obs_dim, dtype=torch.float32)
+
+        obs = {
+            "rgb_static": rgb_static,
+            "rgb_gripper": rgb_gripper,
+            "robot_obs": robot_obs,
+        }
 
         if self.preprocessor is not None:
             images = [x for x in obs["rgb_static"]]
