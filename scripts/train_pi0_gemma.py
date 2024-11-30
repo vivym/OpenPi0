@@ -13,7 +13,6 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from diffusers.training_utils import EMAModel
 from diffusers.utils import is_wandb_available
 from diffusers.utils.torch_utils import is_compiled_module
 from huggingface_hub import create_repo, upload_folder
@@ -28,6 +27,7 @@ from open_pi0.models.pi0_gemma import (
     Pi0GemmaForConditionalGenerationOutputWithPast,
 )
 from open_pi0.optimization import get_scheduler
+from open_pi0.utils.ema import EMAModel
 
 logger = get_logger(__name__)
 
@@ -1021,7 +1021,7 @@ def main(args: Arguments):
     lr_scheduler: LRScheduler
 
     if args.use_ema:
-        ema_model = ema_model.to(accelerator.device)
+        ema_model.to(accelerator.device)
 
     # For mixed precision training we cast all non-trainable weights to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -1348,6 +1348,8 @@ def main(args: Arguments):
             if args.use_ema and accelerator.is_main_process:
                 ema_model.save_pretrained(os.path.join(output_dir, "ema"))
             logger.info(f"Saved state to {output_dir}")
+
+    accelerator.wait_for_everyone()
 
     if args.with_tracking:
         accelerator.end_training()
