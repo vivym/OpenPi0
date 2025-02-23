@@ -20,7 +20,7 @@ def main():
 
     noise_scheduler = FlowMatchEulerDiscreteScheduler(
         num_train_timesteps=1000,
-        shift=3.0,
+        shift=1.0,
     )
 
     noise_scheduler.save_pretrained("weights/pi0gemma-3b-mix-224-initial")

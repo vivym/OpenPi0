@@ -69,10 +69,16 @@ def compute_density_for_timestep_sampling(
     elif weighting_scheme == "mode":
         u = torch.rand(size=(batch_size,), device="cpu")
         u = 1 - u - mode_scale * (torch.cos(math.pi * u / 2) ** 2 - 1 + u)
+    elif weighting_scheme == "beta":
+        beta_dist = get_beta_distribution(batch_size, beta_alpha, beta_beta)
+        u = beta_dist.sample()
+        u = beta_cutoff * u
+        u = torch.clamp(u, 0, 1)
     elif weighting_scheme == "neg_beta":
         beta_dist = get_beta_distribution(batch_size, beta_alpha, beta_beta)
         u = beta_dist.sample()
         u = beta_cutoff * (1 - u)
+        u = torch.clamp(u, 0, 1)
     else:
         u = torch.rand(size=(batch_size,), device="cpu")
     return u
@@ -613,7 +619,7 @@ def parse_args(input_args=None) -> Arguments:
         "--weighting_scheme",
         type=str,
         default="none",
-        choices=["sigma_sqrt", "logit_normal", "mode", "cosmap", "neg_beta", "none"],
+        choices=["sigma_sqrt", "logit_normal", "mode", "cosmap", "beta", "neg_beta", "none"],
         help=('We default to the "none" weighting scheme for uniform sampling and uniform loss'),
     )
 
@@ -1161,6 +1167,9 @@ def main(args: Arguments):
                     logit_mean=args.logit_mean,
                     logit_std=args.logit_std,
                     mode_scale=args.mode_scale,
+                    beta_alpha=args.beta_alpha,
+                    beta_beta=args.beta_beta,
+                    beta_cutoff=args.beta_cutoff,
                 )
                 indices = (u * num_train_timesteps).long()
                 timesteps = noise_scheduler.timesteps[indices].to(device=actions.device)
@@ -1275,6 +1284,9 @@ def main(args: Arguments):
                     logit_mean=args.logit_mean,
                     logit_std=args.logit_std,
                     mode_scale=args.mode_scale,
+                    beta_alpha=args.beta_alpha,
+                    beta_beta=args.beta_beta,
+                    beta_cutoff=args.beta_cutoff,
                 )
                 indices = (u * num_train_timesteps).long()
                 timesteps = noise_scheduler.timesteps[indices].to(device=actions.device)
@@ -1349,11 +1361,6 @@ def main(args: Arguments):
                 ema_model.save_pretrained(os.path.join(output_dir, "ema"))
             logger.info(f"Saved state to {output_dir}")
 
-    accelerator.wait_for_everyone()
-
-    if args.with_tracking:
-        accelerator.end_training()
-
     if args.output_dir is not None:
         accelerator.wait_for_everyone()
         unwrapped_model = unwrap_model(model)
@@ -1374,6 +1381,11 @@ def main(args: Arguments):
                     commit_message="End of training",
                     repo_type="model",
                 )
+
+    accelerator.wait_for_everyone()
+
+    if args.with_tracking:
+        accelerator.end_training()
 
 
 if __name__ == "__main__":
